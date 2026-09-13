@@ -1748,7 +1748,7 @@
   <div class="header-actions">
     <!-- Sponsor / BuyMeACoffee links (à esquerda do Connect) -->
     <span class="tool-version" title="HTML tool version"
-          style="font-size:11px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;letter-spacing:0.5px;margin-right:2px;white-space:nowrap">V0.28</span>
+          style="font-size:11px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;letter-spacing:0.5px;margin-right:2px;white-space:nowrap">V0.29</span>
     <!-- PIX (Brazil): abre modal com QR code pre-gerado inline (offline).
          Cor #32BCAD do branding oficial do PIX. -->
     <button id="btn-pix-open" type="button"
@@ -9334,8 +9334,11 @@ async function overlayOpenPiP() {
   // Tema fixo escuro — sem opção de configuração
   _ovlApplyTheme('dark');
 
-  // Reset buffers — evita carregar amostras antigas se overlay foi reaberto
-  overlayState.bus = { vbus: [], ibus: [], iq: [], ibr: [] };
+  // Reset buffers — evita carregar amostras antigas se overlay foi reaberto.
+  // MANTENHA todas as keys de overlayState.bus (inclusive ft/mt): ovlPush
+  // faz .push() direto no array — se a key falta, estoura TypeError e mata
+  // o listener antes de renderizar τ/pos.
+  overlayState.bus = { vbus: [], ibus: [], iq: [], ibr: [], ft: [], mt: [] };
   overlayState.whl = { trq:  [], pos:  [] };
   overlayState.brakePower.samples = [];
   overlayState.motorPower.samples = [];
