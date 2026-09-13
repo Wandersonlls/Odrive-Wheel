@@ -15,6 +15,7 @@
 #include "EffectsCalculator.h"
 #include "UsbHidHandler.h"
 #include "Axis.h"          // stub interface com metric_t
+#include "Filters.h"       // Biquad — post-filter do axisInertia (parity upstream)
 #include "ffb_defs.h"
 #include "cmsis_os.h"
 #include "tusb.h"
@@ -144,35 +145,56 @@ public:
             axisEffectTorque_ += f;
         }
 
-        // 2. Damper — sempre ativo (proporcional à velocidade)
+        // Constantes clonadas do OpenFFBoard (Axis.h/EffectsCalculator.h):
+        //   AXIS_DAMPER_RATIO   = INTERNAL_SCALER_DAMPER(40) × INTERNAL_AXIS_DAMPER_SCALER(0.7) / 255 ≈ 0.10980
+        //   AXIS_INERTIA_RATIO  = INTERNAL_SCALER_INERTIA(4) × INTERNAL_AXIS_INERTIA_SCALER(0.7) / 255 ≈ 0.01098
+        //   FRICTION_SATURATION = INTERNAL_AXIS_FRICTION_SCALER(0.7) × 32 = 22.4  (força por unidade de intensity quando saturado)
+        //   FRICTION_RAMP_DEG_S = speedRampupCeil(4096) / INTERNAL_SCALER_FRICTION(45) ≈ 91.02 deg/s
+        //   Clip por efeito (intFxClip) = 20000
+        //   Biquads LPF: damperFilter {60 Hz, Q=0.55}, inertiaFilter {20 Hz, Q=0.20},
+        //                frictionFilter {50 Hz, Q=0.20}  — filter_f = 1 kHz da task FFB.
+
+        // 2. Damper — sempre ativo (proporcional à velocidade).
+        // Biquad LPF 60 Hz Q=0.55 no output pra evitar chatter da PLL perto de zero.
         if (axisDamper_ != 0) {
-            float speedF = metrics_.speed * (float)axisDamper_ * 0.0625f;  // AXIS_DAMPER_RATIO
-            if (speedF >  10000.0f) speedF =  10000.0f;
-            if (speedF < -10000.0f) speedF = -10000.0f;
-            axisEffectTorque_ -= (int32_t)speedF;
+            float speedF = metrics_.speed * (float)axisDamper_ * 0.10980f;  // AXIS_DAMPER_RATIO
+            if (speedF >  20000.0f) speedF =  20000.0f;
+            if (speedF < -20000.0f) speedF = -20000.0f;
+            axisEffectTorque_ -= (int32_t)damperFilter_.process(speedF);
         }
 
-        // 3. Inertia — sempre ativa (proporcional à aceleração)
+        // 3. Inertia — sempre ativa (proporcional à aceleração).
+        // Biquad LPF 20 Hz Q=0.20 no output — sem ele, o ruído HF da derivada de
+        // vel_estimate (PLL) vira zumbido acústico em intensity ≳50 (comportamento
+        // observado antes do fix).
         if (axisInertia_ != 0) {
-            float accelF = metrics_.accel * (float)axisInertia_ * 0.0078125f;  // AXIS_INERTIA_RATIO
-            if (accelF >  10000.0f) accelF =  10000.0f;
-            if (accelF < -10000.0f) accelF = -10000.0f;
-            axisEffectTorque_ -= (int32_t)accelF;
+            float accelF = metrics_.accel * (float)axisInertia_ * 0.01098f;  // AXIS_INERTIA_RATIO
+            if (accelF >  20000.0f) accelF =  20000.0f;
+            if (accelF < -20000.0f) accelF = -20000.0f;
+            axisEffectTorque_ -= (int32_t)inertiaFilter_.process(accelF);
         }
 
-        // 4. Friction — sempre ativa (atrito constante com sign de velocidade)
+        // 4. Friction — sempre ativa (atrito de Coulomb com sign de velocidade).
+        // Ramp SINE ease-in-out (0..1) na região |speed| < 91 deg/s pra suavizar
+        // a transição pela origem — derivada zero nas extremidades (vs a rampa
+        // linear anterior, que tinha quina tátil). Biquad LPF 50 Hz Q=0.20 no
+        // output combate chatter da PLL perto de zero.
         if (axisFriction_ != 0) {
-            float speed = metrics_.speed;
-            float intensity = (float)axisFriction_ * 39.0f;  // INTERNAL_SCALER_FRICTION
-            // Ramp linear nos primeiros pcs/seg pra evitar bouncing em zero
-            const float rampThreshold = 50.0f;
-            float fricForce = speed >= 0 ? intensity : -intensity;
-            if (speed > -rampThreshold && speed < rampThreshold) {
-                fricForce = (speed / rampThreshold) * intensity;
+            const float speed = metrics_.speed;
+            const float absSpeed = speed >= 0 ? speed : -speed;
+            const float RAMP_DEG_S = 91.02f;  // = 4096 / INTERNAL_SCALER_FRICTION(45)
+            float rampupFactor = 1.0f;
+            if (absSpeed < RAMP_DEG_S) {
+                // Original upstream: (1 + sin(π × (u - 0.5))) / 2, u = absSpeed/ceil.
+                // Equivalente à half-sine: (1 − cos(π × u)) / 2 (mais barato de raciocinar).
+                const float phase = 3.14159265f * (absSpeed / RAMP_DEG_S);
+                rampupFactor = 0.5f * (1.0f - __builtin_cosf(phase));
             }
-            if (fricForce >  10000.0f) fricForce =  10000.0f;
-            if (fricForce < -10000.0f) fricForce = -10000.0f;
-            axisEffectTorque_ -= (int32_t)fricForce;
+            const float sign = speed >= 0 ? 1.0f : -1.0f;
+            float force = (float)axisFriction_ * rampupFactor * sign * 22.4f;  // 0.7 × 32
+            if (force >  20000.0f) force =  20000.0f;
+            if (force < -20000.0f) force = -20000.0f;
+            axisEffectTorque_ -= (int32_t)frictionFilter_.process(force);
         }
 
         // 5. Endstop eletrônico — mola (esgain) + damper (esdamp) na região de overshoot.
@@ -305,6 +327,14 @@ private:
     int32_t axisEffectTorque_ = 0;       // calculado em calculateAxisEffects
     int32_t lastTorque_       = 0;       // pra slew rate limit
     float accelLpf_           = 0.0f;    // LPF 1ª ordem ~100 Hz sobre d(speed)/dt
+    // Post-filters dos axis effects sempre-ativos, valores 100% clonados do
+    // OpenFFBoard upstream (Axis.h::filterDamperCst / filterFrictionCst /
+    // filterInertiaCst). Fc é normalizado por 1 kHz (sample rate da task FFB).
+    // Sem esses biquads o ruído da PLL passa direto pra corrente do motor e
+    // vira chatter audível quando o efeito satura.
+    Biquad damperFilter_  {BiquadType::lowpass, 0.060f, 0.55f, 0.0f};  // {60 Hz, Q=0.55}
+    Biquad frictionFilter_{BiquadType::lowpass, 0.050f, 0.20f, 0.0f};  // {50 Hz, Q=0.20}
+    Biquad inertiaFilter_ {BiquadType::lowpass, 0.020f, 0.20f, 0.0f};  // {20 Hz, Q=0.20}
 
 public:
     void reset_ffb_state() {
