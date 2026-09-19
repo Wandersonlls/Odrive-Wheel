@@ -1748,7 +1748,7 @@
   <div class="header-actions">
     <!-- Sponsor / BuyMeACoffee links (à esquerda do Connect) -->
     <span class="tool-version" title="HTML tool version"
-          style="font-size:11px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;letter-spacing:0.5px;margin-right:2px;white-space:nowrap">V0.29</span>
+          style="font-size:11px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;letter-spacing:0.5px;margin-right:2px;white-space:nowrap">V0.31</span>
     <!-- PIX (Brazil): abre modal com QR code pre-gerado inline (offline).
          Cor #32BCAD do branding oficial do PIX. -->
     <button id="btn-pix-open" type="button"
@@ -2339,7 +2339,11 @@ const I18N = {
     'ovl.subtitle':            'Abre uma janela "always-on-top" via Document Picture-in-Picture com dois gráficos vivos: barramento DC (vbus/ibus/Iq/I-brake) e dinâmica do volante (torque + posição). Dados vêm direto do HID a 1 kHz nativo — pode rodar em paralelo com o iRacing (ou qualquer jogo) sem disputar nada.',
     'ovl.requirements':        'Requisitos: Chrome/Edge ≥ 116 (Document Picture-in-Picture API). Conexão HID com a placa (auto-reusa a do FFB Force Test ou Performance Test se já estiver aberta).',
     'ovl.config_title':        'Aquisição',
-    'ovl.acq_hint':            'Dados vêm direto do HID inputreport a 1 kHz nativo — sem polling serial, sem brigar com o jogo. Janela do gráfico fixa em 60s.',
+    'ovl.acq_hint':            'Dados vêm direto do HID inputreport a 1 kHz nativo — sem polling serial, sem brigar com o jogo.',
+    'ovl.window_label':        'Janela (s):',
+    'ovl.window_hint':         'Default 60 s, máx 1200 s. Muda em tempo real; dados antigos saem conforme novos chegam. Rolling averages de P_brake/P_motor/Clip permanecem em janela fixa de 60 s.',
+    'ovl.pause_title':         'Pausar aquisição (freeze frame)',
+    'ovl.resume_title':        'Retomar aquisição',
     'ovl.panels_title':        'Painéis do overlay',
     'ovl.panels_hint':         'Desligue o painel que não interessa pra dar todo o espaço pro outro.',
     'ovl.enable_bus':          'Mostrar gráfico de barramento DC (vbus / ibus / Iq / I-brake)',
@@ -3342,7 +3346,11 @@ const I18N = {
     'ovl.subtitle':            'Opens an always-on-top window via the Document Picture-in-Picture API with two live charts: DC bus (vbus/ibus/Iq/I-brake) and wheel dynamics (torque + position). Data comes straight from HID at native 1 kHz — runs in parallel with iRacing (or any game) without contending for the link.',
     'ovl.requirements':        'Requirements: Chrome/Edge ≥ 116 (Document Picture-in-Picture API). HID connection to the board (auto-reuses the one from FFB Force Test or Performance Test if already open).',
     'ovl.config_title':        'Acquisition',
-    'ovl.acq_hint':            'Data comes straight from the HID input report at native 1 kHz — no serial polling, no contention with the game. Chart window fixed at 60s.',
+    'ovl.acq_hint':            'Data comes straight from the HID input report at native 1 kHz — no serial polling, no contention with the game.',
+    'ovl.window_label':        'Window (s):',
+    'ovl.window_hint':         'Default 60 s, max 1200 s. Changes live; old samples fall off as new ones arrive. Rolling averages for P_brake/P_motor/Clip stay on a fixed 60 s window.',
+    'ovl.pause_title':         'Pause acquisition (freeze frame)',
+    'ovl.resume_title':        'Resume acquisition',
     'ovl.panels_title':        'Overlay panels',
     'ovl.panels_hint':         'Turn off the panel you do not need to give all the space to the other.',
     'ovl.enable_bus':          'Show DC bus chart (vbus / ibus / Iq / I-brake)',
@@ -6978,24 +6986,39 @@ async function _setupWriteFromForm(specs) {
     type: s.type,
   })).filter(w => w.value !== null && w.value !== '');
   let ok = 0, fail = 0;
-  for (const w of writes) {
-    const inp = document.getElementById('in-' + w.path);
-    if (!inp) {
-      logLine('setup write: input não achado: ' + w.path, 'err');
-      fail++;
-      continue;
+  // Sinaliza que estamos em bulk write — polls (Step 8 encoder, Debug live,
+  // FFB live, anticog) checam _isBulkBusy() e pulam o próximo tick. Sem isso
+  // a rajada de write+readback interleava com reads periódicos no mesmo canal
+  // ODrive ASCII (FIFO sem correlation ID) e uma resposta atrasada de write
+  // pode cair na readback errada, contaminando o valor.
+  _bulkReadBusy++;
+  try {
+    // Deixa qualquer tick de poll in-flight terminar antes de começar a rajada.
+    // Polls checam o gate no INÍCIO do próximo tick — se um tick já está rodando
+    // suas ~3 reads sequenciais, ele completa; só o próximo pula. 100 ms > maior
+    // intervalo típico de poll (Step 8 = 250 ms mas seu tick termina em ~50 ms).
+    await new Promise(r => setTimeout(r, 100));
+    for (const w of writes) {
+      const inp = document.getElementById('in-' + w.path);
+      if (!inp) {
+        logLine('setup write: input não achado: ' + w.path, 'err');
+        fail++;
+        continue;
+      }
+      // Atualiza valor no SCHEMA input (espelha pra UX consistente quando user
+      // visitar a aba target depois)
+      if (w.bool) inp.checked = !!w.value;
+      else inp.value = String(w.value);
+      try {
+        await writeOne(inp);   // escreve + readback + marca synced (verde)
+        ok++;
+      } catch (e) {
+        logLine('setup write fail: ' + w.path + ' → ' + e.message, 'err');
+        fail++;
+      }
     }
-    // Atualiza valor no SCHEMA input (espelha pra UX consistente quando user
-    // visitar a aba target depois)
-    if (w.bool) inp.checked = !!w.value;
-    else inp.value = String(w.value);
-    try {
-      await writeOne(inp);   // escreve + readback + marca synced (verde)
-      ok++;
-    } catch (e) {
-      logLine('setup write fail: ' + w.path + ' → ' + e.message, 'err');
-      fail++;
-    }
+  } finally {
+    _bulkReadBusy = Math.max(0, _bulkReadBusy - 1);
   }
   return { ok, fail };
 }
@@ -7538,10 +7561,39 @@ function wireSetupTab() {
       if (el) { el.textContent = '— V'; el.style.color = 'var(--fg-muted)'; }
       return;
     }
+    // Local helper: espera pendingReplies drenar (até maxMs), senão descarta
+    // stragglers. Reset defensivo pra evitar queue desync ODrive ASCII —
+    // uma resposta atrasada de write anterior (>80 ms) pode ter caído em
+    // pendente errado; começamos daqui com pipeline garantidamente limpo.
+    const _spWaitQuiescent = async (maxMs) => {
+      const deadline = performance.now() + maxMs;
+      while (pendingReplies.length > 0 && performance.now() < deadline) {
+        await new Promise(r => setTimeout(r, 20));
+      }
+      if (pendingReplies.length > 0) {
+        for (const p of pendingReplies) {
+          clearTimeout(p.timeout);
+          try { p.resolve(null); } catch (err) {}
+        }
+        pendingReplies.length = 0;
+        readBuffer = '';
+        logLine('setup vbus: flushed stale pending replies', 'err');
+      }
+    };
     const orig = btn.textContent;
     btn.disabled = true;
     btn.textContent = '⏳';
+    // Sinaliza bulk pra polls periódicos pausarem — mesmo padrão do
+    // _setupWriteFromForm e do readAll(). Sem isso, o poll do Step 8
+    // encoder (250 ms) e o do Debug live intercalam reads nos ~1 s
+    // que esse handler gasta com 1 read + 5×(write+readback).
+    _bulkReadBusy++;
     try {
+      // Deixa ticks in-flight terminarem antes de mandar nosso primeiro read.
+      await new Promise(r => setTimeout(r, 100));
+      // 0. Flush defensivo — garante pipeline limpo antes de qualquer read/write.
+      await _spWaitQuiescent(300);
+
       // 1. Lê vbus_voltage atual via Serial
       const s = await readProp('vbus_voltage').catch(() => null);
       if (s === null || s === '') {
@@ -7567,16 +7619,46 @@ function wireSetupTab() {
       const rampStart = v + 0.5;
       const rampEnd   = v + 3;
 
-      // 3. Escreve TUDO usando _setupWriteFromForm com valores literais.
-      //    Isso atualiza tanto o input do schema (em outra aba) quanto envia
-      //    pra firmware via writeProp ODrive.
-      const r = await _setupWriteFromForm([
-        { path: 'config.dc_bus_undervoltage_trip_level', type: 'number', value: uv },
-        { path: 'config.dc_bus_overvoltage_trip_level',  type: 'number', value: ov },
-        { path: 'config.enable_dc_bus_overvoltage_ramp', type: 'bool',   value: true },
-        { path: 'config.dc_bus_overvoltage_ramp_start',  type: 'number', value: rampStart },
-        { path: 'config.dc_bus_overvoltage_ramp_end',    type: 'number', value: rampEnd },
-      ]);
+      // 3. Escreve os 5 configs manualmente COM settle delay entre write e
+      //    readback. Fix pra queue desync: se o write demora pra ODrive
+      //    responder (>80 ms writeProp timeout), a resposta atrasada chegava
+      //    na próxima readback e contaminava o valor. Com 30 ms de settle e
+      //    pendingReplies vazio nesse intervalo, a linha atrasada cai em
+      //    shift() vazio (line 14882 `if (p)`) e é silenciosamente descartada.
+      const writes = [
+        { path: 'config.dc_bus_undervoltage_trip_level', val: uv.toFixed(2),        bool: false },
+        { path: 'config.dc_bus_overvoltage_trip_level',  val: ov.toFixed(2),        bool: false },
+        { path: 'config.enable_dc_bus_overvoltage_ramp', val: '1',                  bool: true  },
+        { path: 'config.dc_bus_overvoltage_ramp_start',  val: rampStart.toFixed(2), bool: false },
+        { path: 'config.dc_bus_overvoltage_ramp_end',    val: rampEnd.toFixed(2),   bool: false },
+      ];
+      let ok = 0, fail = 0;
+      for (const w of writes) {
+        // Atualiza input SCHEMA em espelho (mesmo comportamento visual do
+        // _setupWriteFromForm original — verde após sync bem-sucedido).
+        const inp = document.getElementById('in-' + w.path);
+        if (inp) {
+          if (w.bool) inp.checked = (w.val === '1');
+          else        inp.value   = w.val;
+        }
+        try {
+          await writeProp(w.path, w.val);
+          // Settle 30 ms — janela pra resposta atrasada do write cair em
+          // shift() vazio antes da próxima readback.
+          await new Promise(r => setTimeout(r, 30));
+          const vv = await readProp(w.path);
+          if (vv !== null) {
+            if (inp) setInputValue(inp, vv, /*markSynced=*/true);
+            ok++;
+          } else {
+            fail++;
+          }
+        } catch (err) {
+          logLine('setup vbus write fail: ' + w.path + ' → ' + err.message, 'err');
+          fail++;
+        }
+      }
+      const r = { ok, fail };
 
       // 4. Atualiza os campos visíveis no form do Quick Start (uv e ov)
       //    pra usuário ver os valores configurados
@@ -7594,6 +7676,7 @@ function wireSetupTab() {
       toast(t('setup.toast_vbus_configured').replace('{v}', v.toFixed(2)),
             r.fail === 0 ? 'ok' : 'warn');
     } finally {
+      _bulkReadBusy = Math.max(0, _bulkReadBusy - 1);
       btn.textContent = orig;
       btn.disabled = false;
     }
@@ -8201,6 +8284,13 @@ const overlayState = {
   hidDevice:   null,        // HIDDevice em uso (reusa ptDevice/fbtDevice se aberto)
   hidListener: null,        // callback registrado em 'inputreport'
   drawTimer:   null,        // setInterval ~30 Hz pra render throttled
+  // Janela de aquisição em segundos — controla a capacidade dos buffers de
+  // chart (windowSec × 100 amostras). Persiste via localStorage. Range 1..1200s.
+  windowSec:   60,
+  // Pause de aquisição — quando true, o listener HID sai cedo e nenhum push
+  // acontece (nem chart nem power accumulators). Draw timer continua rodando
+  // pra manter o overlay visível (freeze frame).
+  paused:      false,
   // Histórico decimado p/ charts (~100 Hz, janela 60s = 6000 entries cada)
   //   ft/mt = FET/motor temp em °C (int8 no HID, -128 = sensor off → NaN).
   //   Push condicionado no _ovlOnHidReport pra não sujar buffer com valores
@@ -8258,10 +8348,13 @@ function _ovlApplyPanelVisibility() {
   if (pFft) pFft.classList.toggle('hidden', !showFft);
 }
 
-// Capacidade dos buffers de chart: 60s × 100 Hz (após decimação 10× do HID)
-// = 6000 amostras por série. Fixo, sem mais "intervalo de aquisição".
+// Capacidade dos buffers de chart: windowSec × 100 Hz (após decimação 10× do HID).
+// Default 60s → 6000 amostras. Configurável via campo "Window (s)" na aba
+// (1..1200 s). Trimming acontece no ovlPush — se o usuário reduz o valor,
+// samples excedentes vão saindo naturalmente conforme novas amostras chegam.
 function ovlMaxSamples() {
-  return 6000;
+  const w = overlayState.windowSec;
+  return Math.max(100, Math.round((isFinite(w) ? w : 60) * 100));
 }
 function ovlPush(group, key, val) {
   if (val === null || val === undefined || isNaN(val)) return;
@@ -8286,8 +8379,17 @@ function buildOverlayHTML() {
 
     <div class="debug-section">
       <h3 data-i18n="ovl.config_title">Aquisição</h3>
-      <p style="color:var(--muted);font-size:13px;margin:0"
-         data-i18n="ovl.acq_hint">Dados vêm direto do HID inputreport a 1 kHz nativo — sem polling serial, sem brigar com o jogo. Janela do gráfico fixa em 60s.</p>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 10px"
+         data-i18n="ovl.acq_hint">Dados vêm direto do HID inputreport a 1 kHz nativo — sem polling serial, sem brigar com o jogo.</p>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:8px;font-size:14px">
+          <span data-i18n="ovl.window_label">Janela (s):</span>
+          <input type="number" id="ovl-window-sec" min="1" max="1200" step="1" value="60"
+                 style="width:80px;background:#1e2023;color:#eee;border:1px solid #444;border-radius:3px;padding:3px 6px">
+        </label>
+        <span style="color:var(--muted);font-size:12px"
+              data-i18n="ovl.window_hint">Default 60 s, máx 1200 s. Muda em tempo real; dados antigos saem conforme novos chegam. Rolling averages de P_brake/P_motor/Clip permanecem em janela fixa de 60 s.</span>
+      </div>
     </div>
 
     <div class="debug-section">
@@ -8484,16 +8586,21 @@ function _ovlPipStyles() {
        Usa :has() pra detectar visualmente — gracefully degrade em browsers
        sem suporte (a barra fica visível mas vazia, com 20px de altura). */
     .ovl-info-bar:not(:has(span:not([hidden]))) { display: none; }
-    .ovl-conn {
+    /* Container flex do canto sup-direito — agrupa pause e indicator pra
+       nunca colidirem, independente do tamanho do texto do conn. */
+    .ovl-topbar {
       position: absolute;
       top: 4px; right: 6px;
+      display: flex; align-items: center; gap: 4px;
+      z-index: 10;
+    }
+    .ovl-conn {
       font-size: 14px;
       padding: 1px 5px;
       background: rgba(0, 0, 0, 0.45);
       border-radius: 2px;
       color: #c0c0c0;
       pointer-events: none;
-      z-index: 10;
     }
     body.theme-light .ovl-conn {
       background: rgba(255, 255, 255, 0.7);
@@ -8501,6 +8608,28 @@ function _ovlPipStyles() {
     }
     .ovl-conn.disconnected { color: #ef5350 !important; }
     .ovl-conn.connected { color: #2e7d32 !important; }
+    /* Pause/play toggle — pequeno (~20px) pra roubar mínimo espaço do plot.
+       Fica à esquerda do conn indicator dentro do .ovl-topbar. */
+    .ovl-pause {
+      width: 22px; height: 20px;
+      padding: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; line-height: 1;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 2px;
+      color: #d0d0d0;
+      cursor: pointer;
+      user-select: none;
+    }
+    .ovl-pause:hover { background: rgba(0, 0, 0, 0.65); color: #fff; }
+    .ovl-pause.paused { color: #ffa726; border-color: rgba(255, 167, 38, 0.6); }
+    body.theme-light .ovl-pause {
+      background: rgba(255, 255, 255, 0.7);
+      border-color: rgba(0, 0, 0, 0.15);
+      color: #444;
+    }
+    body.theme-light .ovl-pause:hover { background: rgba(255, 255, 255, 0.95); color: #000; }
     /* P_brake — readout textual dentro da info-bar (sem overlay sobre o chart).
        Visível só quando o checkbox "ovl-show-brake-power" está ativo
        (toggle via attr [hidden]). Mantém visibilidade legível nos dois temas.
@@ -8572,7 +8701,10 @@ function _ovlPipHTML() {
       <div class="ovl-panel" id="pip-panel-fft">
         <canvas id="pip-fft-chart"></canvas>
       </div>
-      <span class="ovl-conn" id="pip-conn">—</span>
+      <div class="ovl-topbar">
+        <button class="ovl-pause" id="pip-pause" type="button" title="Pause acquisition">⏸</button>
+        <span class="ovl-conn" id="pip-conn">—</span>
+      </div>
     </div>
   `;
 }
@@ -8680,7 +8812,7 @@ function drawOvlBusChart() {
     }
   }
   ctx.fillStyle = th.fgMuted; ctx.textAlign = 'left';
-  ctx.fillText('-60s', padL, padT + H + 14);
+  ctx.fillText('-' + overlayState.windowSec + 's', padL, padT + H + 14);
   ctx.textAlign = 'right';
   ctx.fillText('agora', padL + W, padT + H + 14);
 
@@ -8777,7 +8909,7 @@ function drawOvlWhlChart() {
     ctx.fillText(pR.toFixed(0) + '°', padL + W + 3, y);
   }
   ctx.fillStyle = th.fgMuted; ctx.textAlign = 'left';
-  ctx.fillText('-60s', padL, padT + H + 14);
+  ctx.fillText('-' + overlayState.windowSec + 's', padL, padT + H + 14);
   ctx.textAlign = 'right';
   ctx.fillText('agora', padL + W, padT + H + 14);
 
@@ -8965,6 +9097,9 @@ function _ovlFmtSigned2(v) {
 // buffers de P_brake e P_motor a 1 kHz cheio, e decima 10× pra charts.
 function _ovlOnHidReport(event) {
   if (event.reportId !== 0x01) return;
+  // Pause "freeze frame" — descarta o report inteiro (chart e power accumulators).
+  // Draw timer segue rodando; overlay mantém os últimos valores até despausar.
+  if (overlayState.paused) return;
 
   // Offsets (sem o report_id, que o HID já strippa):
   //   0..7   buttons (uint64)
@@ -9298,6 +9433,23 @@ async function overlayOpenPiP() {
   // Re-bind canvas refs
   overlayState.cvBus = pip.document.getElementById('pip-bus-chart');
   overlayState.cvWhl = pip.document.getElementById('pip-whl-chart');
+
+  // Wire pause/play toggle. Sempre abre despausado — se o user tinha pausado
+  // antes de fechar, botão volta pra ⏸ na reabertura (menos surpresa).
+  overlayState.paused = false;
+  const btnPause = pip.document.getElementById('pip-pause');
+  if (btnPause) {
+    const syncPauseVisual = () => {
+      btnPause.textContent = overlayState.paused ? '▶' : '⏸';
+      btnPause.title = overlayState.paused ? t('ovl.resume_title') : t('ovl.pause_title');
+      btnPause.classList.toggle('paused', overlayState.paused);
+    };
+    syncPauseVisual();
+    btnPause.addEventListener('click', () => {
+      overlayState.paused = !overlayState.paused;
+      syncPauseVisual();
+    });
+  }
 
   // Aplica visibilidade dos painéis baseado nos checkboxes da aba principal
   _ovlApplyPanelVisibility();
@@ -9673,6 +9825,20 @@ function wireOverlayTab() {
   const cbCO = document.getElementById('ovl-show-clipout');
   if (cbCO && typeof saved.show_clipout === 'boolean') cbCO.checked = saved.show_clipout;
 
+  // Janela de aquisição — restaura valor salvo (fallback 60s), clamp 1..1200.
+  const inpWin = document.getElementById('ovl-window-sec');
+  const clampWindow = (raw) => {
+    const n = Math.round(Number(raw));
+    if (!isFinite(n) || n < 1) return 60;
+    if (n > 1200) return 1200;
+    return n;
+  };
+  if (inpWin) {
+    const initial = clampWindow(saved.window_sec ?? 60);
+    inpWin.value = String(initial);
+    overlayState.windowSec = initial;
+  }
+
   function persist() {
     const obj = {
       show_vbus:  document.getElementById('ovl-show-vbus')?.checked,
@@ -9687,8 +9853,22 @@ function wireOverlayTab() {
       show_motor_power: document.getElementById('ovl-show-motor-power')?.checked,
       show_clipout:     document.getElementById('ovl-show-clipout')?.checked,
       enable_fft:       document.getElementById('ovl-enable-fft')?.checked,
+      window_sec:       overlayState.windowSec,
     };
     try { localStorage.setItem(KEY, JSON.stringify(obj)); } catch (e) {}
+  }
+
+  // Handler do campo janela — atualiza overlayState.windowSec e persiste.
+  // Aplica clamp no blur (evita "salto" enquanto o usuário ainda digita).
+  if (inpWin) {
+    const applyWindow = () => {
+      const v = clampWindow(inpWin.value);
+      inpWin.value = String(v);
+      overlayState.windowSec = v;
+      persist();
+    };
+    inpWin.addEventListener('change', applyWindow);
+    inpWin.addEventListener('blur',   applyWindow);
   }
 
   ['vbus', 'ibus', 'iq', 'ibr', 'fet-temp', 'motor-temp'].forEach(k => {
@@ -15720,6 +15900,10 @@ function buildTabs() {
     };
 
     const updateAnticogProgress = async () => {
+      // Gate: pula durante qualquer bulk op (readAll, Apply, Set voltage).
+      // Sem isso os 3 reads sequenciais aqui podem colidir com writes+readbacks
+      // de ops críticas rodando em paralelo.
+      if (typeof window._isBulkBusy === 'function' && window._isBulkBusy()) return;
       const idx = parseInt(await readProp('axis0.controller.config.anticogging.index') || '0', 10);
       const valid = await readProp('axis0.controller.anticogging_valid');
       const axisErr = parseInt(await readProp('axis0.error') || '0', 10);
@@ -17916,6 +18100,9 @@ function _setRateKV(id, hz) {
 
 async function pollFFBLiveOnce() {
   if (!writer || ffbPollInFlight) return;
+  // Gate: pausa durante qualquer bulk op — evita reads da FFB tab
+  // interleavarem com writes+readbacks das ops críticas.
+  if (typeof window._isBulkBusy === 'function' && window._isBulkBusy()) return;
   ffbPollInFlight = true;
   const dot = document.getElementById('ffb-poll-dot');
   if (dot) dot.classList.add('on');
@@ -18533,6 +18720,11 @@ function drawChart() {
 }
 
 async function refreshLive() {
+  // Gate: se qualquer bulk op (readAll, Apply, Set voltage) está rodando,
+  // pula esse tick. Sem isso, os ~20 reads sequenciais aqui interleavam
+  // com writes+readbacks das ops críticas e podem dessincronizar a FIFO
+  // pendingReplies (ODrive ASCII não tem correlation ID).
+  if (typeof window._isBulkBusy === 'function' && window._isBulkBusy()) return;
   // Bulk read — cada call é síncrona + sequencial (queue pattern)
   const reads = [
     ['kv-vbus',    'vbus_voltage',                           (v) => parseFloat(v).toFixed(3) + ' V'],
