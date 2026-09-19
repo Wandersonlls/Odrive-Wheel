@@ -466,8 +466,18 @@
                         they wrote. If you edited values in the HTML tool while SimHub was running, hit
                         the button below to re-sync.
                     </TextBlock>
-                    <Button Content="↻ Refresh from device now" Click="OnRefreshNow"
-                            Style="{StaticResource PrimaryButton}" HorizontalAlignment="Left" Margin="0,10,0,4"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,10,0,4">
+                        <Button Content="↻ Refresh from device now" Click="OnRefreshNow"
+                                Style="{StaticResource PrimaryButton}"/>
+                        <!-- One-shot: captures current wheel position as the new zero.
+                             Same as axis.zeroenc! in the HTML tool. Useful for
+                             incremental encoders (no Z index) or after any physical
+                             re-mount that shifted the mechanical center. -->
+                        <Button Content="◎ Zero wheel (set current as center)" Click="OnZeroWheel"
+                                Style="{StaticResource SecondaryButton}" Margin="10,0,0,0"/>
+                        <TextBlock x:Name="DeviceActionStatus" Style="{StaticResource Muted}"
+                                   VerticalAlignment="Center" Margin="14,0,0,0"/>
+                    </StackPanel>
                     <StackPanel x:Name="DeviceConfigStack" Margin="0,10,0,0"/>
                 </StackPanel>
             </Border>

@@ -457,6 +457,43 @@ namespace OdriveWheel.SimHubPlugin
             });
         }
 
+        // One-shot: fire axis.zeroenc! on the board. Same effect as the
+        // "ZeroWheelPosition" bindable action — this button is a convenience
+        // for users who don't want to go through Controls & Events, and it
+        // ALWAYS shows a status string so silent failures (port busy, no
+        // device, timeout) are visible without diving into SimHub logs.
+        private void OnZeroWheel(object sender, RoutedEventArgs e)
+        {
+            DeviceActionStatus.Text = "sending axis.zeroenc!…";
+            DeviceActionStatus.Foreground = System.Windows.Media.Brushes.LightGray;
+            var cli = _plugin.SerialCli;
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                string reply = null;
+                string err   = null;
+                try { reply = cli.ExecOffb("axis.zeroenc"); }
+                catch (Exception ex) { err = ex.Message; }
+                Dispatcher.Invoke(() =>
+                {
+                    if (err != null)
+                    {
+                        DeviceActionStatus.Text = "zero failed: " + err;
+                        DeviceActionStatus.Foreground = System.Windows.Media.Brushes.IndianRed;
+                    }
+                    else if (reply == null)
+                    {
+                        DeviceActionStatus.Text = "no reply — check SimHub log (port busy, device not present, or timeout)";
+                        DeviceActionStatus.Foreground = System.Windows.Media.Brushes.Orange;
+                    }
+                    else
+                    {
+                        DeviceActionStatus.Text = "zero OK — current wheel position is the new center";
+                        DeviceActionStatus.Foreground = System.Windows.Media.Brushes.LightGreen;
+                    }
+                });
+            });
+        }
+
         private void OnApplyProfile(object sender, RoutedEventArgs e)
         {
             var item = CmbProfiles.SelectedItem as ProfileListItem;
